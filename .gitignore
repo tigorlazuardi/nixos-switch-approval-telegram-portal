@@ -1,0 +1,9 @@
+# nix build output
+/result
+/result-*
+
+# go
+/switchd
+/request-switch
+*.test
+*.out
