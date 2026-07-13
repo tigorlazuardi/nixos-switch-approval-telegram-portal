@@ -2,6 +2,9 @@
 /result
 /result-*
 
+# pi local task state
+/.pi/tasks/
+
 # go
 /switchd
 /request-switch

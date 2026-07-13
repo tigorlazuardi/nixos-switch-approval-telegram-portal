@@ -57,22 +57,19 @@ Two layers over one daemon:
 
 The daemon can cause a root `nixos-rebuild switch`. Containment:
 
-1. **The client never supplies a command or flake.** The daemon executes ONE
-   hardcoded action shape: `nixos-rebuild switch --flake <REPO_FLAKE_REF>` (ref
-   from config, not from the request). The request carries only `mode` + a
-   free-text `reason`. This is what removes RCE: submitting a request can, at
-   worst, spam approval prompts — it can never choose what runs.
+1. **The client never supplies a command or flake.** The daemon builds the
+   configured flake, resolves the built immutable toplevel, and after approval
+   executes that toplevel's `bin/switch-to-configuration switch` through the
+   configured activation prefix. The request carries only `mode` + a free-text
+   `reason`. This is what removes RCE: submitting a request can, at worst, spam
+   approval prompts — it can never choose what runs.
 2. **Execution is gated solely on an Approve from an allow-listed Telegram user
    id.** Verify `callback_query.from.id ∈ ALLOWED_USER_IDS`. Ignore approvals from
    anyone else. A leaked bot token does not grant approval (the attacker is not
    you pressing the button).
 3. **Least privilege.** The daemon runs as a **non-root** user (`switchd`). It
    invokes the privileged action through a **scoped sudoers/polkit** rule that
-   permits ONLY the exact fixed commands (`nixos-rebuild switch --flake <ref>` and
-   `nix flake update ...` in the fixed repo dir), NOPASSWD, fixed args. If the
-   daemon is exploited, blast radius = those two commands, not a root shell. The
-   daemon must invoke them as an argv vector (`exec`), never through a shell
-   string.
+   permits ONLY activation of the already-built toplevel (`/nix/store/.../bin/switch-to-configuration switch`) and `nix flake update ...` in the fixed repo dir, NOPASSWD, fixed args. If the daemon is exploited, blast radius = those commands, not a root shell. The daemon must invoke them as an argv vector (`exec`), never through a shell string.
 4. **Request↔approval binding via nonce.** Each request gets an unguessable id;
    the inline-keyboard callback carries it. An old Approve button must not trigger
    a new/different switch (no replay). One-shot: a nonce is consumed on
@@ -107,9 +104,10 @@ how you produce the diff).
 
 ## Open decisions (defaults chosen — flag if you disagree)
 
-- **What gets switched:** the **working tree** at `REPO_DIR` (default
-  `/home/homeserver/homelab`), ref `<REPO_DIR>#homeserver`. Matches the manual
-  flow (dirty tree included). Configurable.
+- **What gets switched:** the **working tree** at required `REPO_DIR`, ref
+  `<REPO_DIR>#homeserver` unless overridden. Matches the manual flow (dirty tree
+  included). The app has no repo-dir default; the host module must set
+  `SWITCHD_REPO_DIR` directly or through `SWITCHD_REPO_DIR_FILE`.
 - **Timeouts:** sync (agent) approval window default **30 min**; async (timer)
   window default **24 h**. Expiry → auto-reject + notify.
 - **Concurrency:** **single-flight** — one pending/active switch at a time. A new
@@ -161,10 +159,11 @@ counterpart. Suggested names (finalize + document in README):
 | `SWITCHD_ALLOWED_USER_IDS` / `..._FILE` | comma-list of approver Telegram user ids | yes (`_FILE`) |
 | `SWITCHD_CHAT_ID` / `..._FILE` | chat to post approval messages to | yes (`_FILE`) |
 | `SWITCHD_SOCKET_PATH` | unix socket path | no (default `/run/switchd/sock`) |
-| `SWITCHD_REPO_DIR` | flake repo working dir | no (default `/home/homeserver/homelab`) |
-| `SWITCHD_FLAKE_REF` | ref to switch | no (default `<REPO_DIR>#homeserver`) |
-| `SWITCHD_SYNC_TIMEOUT` / `SWITCHD_ASYNC_TIMEOUT` | approval windows | no |
-| `SWITCHD_REBUILD_CMD` | the scoped-sudo wrapper to invoke (e.g. `sudo nixos-rebuild`) | no |
+| `SWITCHD_REPO_DIR` / `SWITCHD_REPO_DIR_FILE` | privacy-sensitive flake repo working dir; required, no app default; host module must require direct value or file | no |
+| `SWITCHD_FLAKE_REF` / `SWITCHD_FLAKE_REF_FILE` | ref to switch; `_FILE` supported for path privacy | no (default `<SWITCHD_REPO_DIR>#homeserver`) |
+| `SWITCHD_SYNC_TIMEOUT` / `SWITCHD_ASYNC_TIMEOUT` | build + approval windows; not reused for activation | no |
+| `SWITCHD_ACTIVATE_TIMEOUT` | activation timeout that starts only after approval (default `30m`; `0` = no artificial activation deadline) | no |
+| `SWITCHD_ACTIVATE_CMD` | activation argv prefix (default `sudo`); daemon appends `<built-toplevel>/bin/switch-to-configuration switch` | no |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Alloy OTLP | no |
 
 ## Host integration contract (separate homelab task — do NOT build here)
@@ -173,8 +172,8 @@ For reference so the interfaces stay stable. In the `homelab` repo:
 
 - Add this repo as a flake input; new `services/switch-daemon.nix`:
   - user `switchd` (non-login), group for socket access.
-  - `security.sudo` (or polkit) rule: `switchd` may run ONLY
-    `nixos-rebuild switch --flake <ref>` and `nix flake update ...` NOPASSWD.
+  - `security.sudo` (or polkit) rule: `switchd` may run ONLY the already-built
+    toplevel activation (`/nix/store/.../bin/switch-to-configuration switch`) and `nix flake update ...` NOPASSWD.
   - `systemd.tmpfiles` for the socket dir (`/run/switchd`, `switchd`-owned).
   - sops `secrets/switch-portal.yaml` (bot_token, allowed_user_ids, chat_id),
     owner `switchd`, exposed via the `*_FILE` env vars.
