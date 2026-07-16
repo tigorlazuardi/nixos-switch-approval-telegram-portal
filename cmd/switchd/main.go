@@ -333,7 +333,13 @@ func (d *daemon) runRequest(st *requestState) {
 
 	d.emit(st, frame{Type: "status", Message: "building"})
 	start := time.Now()
-	if err := d.runCmd(preApprovalCtx, st, logFile, []string{"nixos-rebuild", "build", "--flake", d.cfg.FlakeRef}); err != nil {
+	buildRef, cleanupSnapshot, err := sanitizedBuildRef(d.cfg.FlakeRef)
+	if err != nil {
+		d.emit(st, frame{Type: "error", Message: "prepare build source: " + err.Error()})
+		return
+	}
+	defer cleanupSnapshot()
+	if err := d.runCmd(preApprovalCtx, st, logFile, []string{"nixos-rebuild", "build", "--flake", buildRef, "--out-link", filepath.Join(d.cfg.RepoDir, "result")}); err != nil {
 		d.emit(st, frame{Type: "error", Message: "build failed: " + err.Error()})
 		d.notify(st, "Build failed", tail(st.logTail, 25))
 		return
@@ -423,6 +429,139 @@ func (d *daemon) runCmd(ctx context.Context, st *requestState, logFile io.Writer
 		return fmt.Errorf("%s failed: %w", argv[0], err)
 	}
 	return nil
+}
+
+func sanitizedBuildRef(ref string) (string, func(), error) {
+	path, fragment, local, err := localFlakeRef(ref)
+	if err != nil || !local {
+		return ref, func() {}, err
+	}
+	tmp, err := os.MkdirTemp("", "switchd-source-")
+	if err != nil {
+		return "", func() {}, fmt.Errorf("create source snapshot: %w", err)
+	}
+	cleanup := func() { _ = os.RemoveAll(tmp) }
+	snapshot := filepath.Join(tmp, "source")
+	if err := copySanitizedTree(path, snapshot); err != nil {
+		cleanup()
+		return "", func() {}, err
+	}
+	return "path:" + snapshot + fragment, cleanup, nil
+}
+
+func localFlakeRef(ref string) (path, fragment string, local bool, err error) {
+	pathPart, fragment, _ := strings.Cut(ref, "#")
+	if strings.Contains(pathPart, "?") {
+		switch {
+		case strings.HasPrefix(pathPart, "/"), strings.HasPrefix(pathPart, "path:/"), strings.HasPrefix(pathPart, "file:///"), strings.HasPrefix(pathPart, "git+file:///"):
+			return "", "", false, fmt.Errorf("local flake refs must not contain query parameters")
+		}
+	}
+	switch {
+	case strings.HasPrefix(pathPart, "/"):
+		path = pathPart
+	case strings.HasPrefix(pathPart, "path:/"):
+		path = strings.TrimPrefix(pathPart, "path:")
+	case strings.HasPrefix(pathPart, "file:///"):
+		path = "/" + strings.TrimPrefix(pathPart, "file:///")
+	case strings.HasPrefix(pathPart, "git+file:///"):
+		path = "/" + strings.TrimPrefix(pathPart, "git+file:///")
+	default:
+		return "", "", false, nil
+	}
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return "", "", false, fmt.Errorf("local flake path must be canonical and absolute")
+	}
+	resolved, resolveErr := filepath.EvalSymlinks(path)
+	if resolveErr != nil || resolved != path {
+		return "", "", false, fmt.Errorf("local flake path must exist and contain no symlinks")
+	}
+	if fragment != "" {
+		fragment = "#" + fragment
+	}
+	return path, fragment, true, nil
+}
+
+func copySanitizedTree(source, destination string) error {
+	info, err := os.Lstat(source)
+	if err != nil {
+		return fmt.Errorf("inspect local flake: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("local flake source is not a directory")
+	}
+	if err := os.Mkdir(destination, 0700); err != nil {
+		return fmt.Errorf("create source snapshot: %w", err)
+	}
+	return filepath.WalkDir(source, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == source {
+			return nil
+		}
+		if entry.Name() == ".git" {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		rel, err := filepath.Rel(source, path)
+		if err != nil {
+			return err
+		}
+		dst := filepath.Join(destination, rel)
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		switch {
+		case info.IsDir():
+			if err := os.Mkdir(dst, 0700); err != nil {
+				return err
+			}
+			return os.Chmod(dst, info.Mode().Perm()|0700)
+		case info.Mode().IsRegular():
+			return copyRegularFile(path, dst, info.Mode().Perm())
+		case info.Mode()&os.ModeSymlink != 0:
+			target, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			resolved, err := filepath.EvalSymlinks(path)
+			if err != nil {
+				return fmt.Errorf("local flake contains dangling symlink %q: %w", path, err)
+			}
+			resolved, err = filepath.Abs(resolved)
+			if err != nil {
+				return err
+			}
+			if resolved != source && !strings.HasPrefix(resolved, source+string(filepath.Separator)) && !strings.HasPrefix(resolved, "/nix/store/") {
+				return fmt.Errorf("local flake symlink %q escapes source tree and Nix store", path)
+			}
+			return os.Symlink(target, dst)
+		default:
+			return fmt.Errorf("local flake contains unsupported special file %q", path)
+		}
+	})
+}
+
+func copyRegularFile(source, destination string, mode os.FileMode) error {
+	in, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(out, in)
+	closeErr := out.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
 }
 
 func resolveBuiltToplevel(repoDir string) (string, error) {

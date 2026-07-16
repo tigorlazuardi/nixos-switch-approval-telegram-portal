@@ -8,11 +8,10 @@ timer) request a `nixos-rebuild switch` which the operator approves from
 The daemon is **root-capable but least-privilege**. Read the Security section
 first; its invariants are non-negotiable.
 
-> This repo produces the binaries + a `flake.nix`. The NixOS host wiring
-> (`services/switch-daemon.nix`: the `switchd` user, scoped sudoers, the sops
-> secret, the systemd units, the flake-update timer) lives in the separate
-> `homelab` repo and consumes THIS repo as a flake input. Keep the two contracts
-> (below) stable.
+> This repo produces the binaries, package, flake outputs, and reusable NixOS
+> module. The separate `homelab` repo consumes THIS repo as a flake input and
+> owns host-specific imports, real sops secrets, client users, and the
+> flake-update timer. Keep the two contracts (below) stable.
 
 ## Goal
 
@@ -43,13 +42,18 @@ Two layers over one daemon:
 - **flake.nix REQUIRED** (the host consumes this repo as a flake input):
   - `packages.default` (or named) building both binaries via `buildGoModule`
     (`vendorHash = null` while dependency-free).
-  - `packages.switchd` + `packages.request-switch` if split is convenient.
+  - `packages.switchd` + `packages.request-switch` may alias the same package
+    because it builds both binaries.
   - a `devShells.default` with `go`, `gopls`, `gotools`.
-  - `x86_64-linux` is the only target that must work (the host arch).
+  - Linux outputs for `x86_64-linux` and `aarch64-linux`.
+  - `nixosModules.default` / `nixosModules.switchd` exposing the reusable service
+    module; host repos still own actual secret files and imports.
 - **Config: everything via env, secrets via `*_FILE`.** The host exposes ALL
-  config through the NixOS module — env vars for plain values, and a `<VAR>_FILE`
-  variant for every secret (the module points these at sops secret file paths).
-  A `_FILE` var wins over its plain counterpart. See Config contract.
+  config through the NixOS module. Public module secret options are file-only
+  (`botTokenFile`, `allowedUserIdsFile`, `chatIdFile`) so values never enter Nix
+  derivations/store/unit config; host points them at sops runtime paths. The Go
+  daemon retains plain env support for non-Nix/manual use, with `_FILE` winning.
+  See Config contract.
 - **New Telegram bot** — its own token + a separate sops secret in homelab (NOT
   the smartd bot).
 
@@ -69,7 +73,33 @@ The daemon can cause a root `nixos-rebuild switch`. Containment:
    you pressing the button).
 3. **Least privilege.** The daemon runs as a **non-root** user (`switchd`). It
    invokes the privileged action through a **scoped sudoers/polkit** rule that
-   permits ONLY activation of the already-built toplevel (`/nix/store/.../bin/switch-to-configuration switch`) and `nix flake update ...` in the fixed repo dir, NOPASSWD, fixed args. If the daemon is exploited, blast radius = those commands, not a root shell. The daemon must invoke them as an argv vector (`exec`), never through a shell string.
+   permits ONLY the module-generated `switchd-activate` helper's exact store path,
+   NOPASSWD, fixed args. The helper accepts only the pre-approved
+   `<toplevel>/bin/switch-to-configuration switch` as an expected value, rebuilds
+   the module-configured flake as root with a private out-link, compares the
+   rebuilt toplevel exactly to the pre-approved toplevel, and activates only the
+   rebuilt toplevel. `repoDir`, `repoDirFile`, `flakeRefFile`, and local-path
+   `flakeRef` values are trusted root inputs: they must be canonical absolute
+   paths without symlinks, not owned by the service user, and not writable by the
+   service user, any primary/supplementary service group, ACL grants, or world;
+   ACL inspection fails closed. The helper checks ancestors and local source-tree
+   entries and rejects linked-worktree `.git` indirection. For local refs it then
+   copies the tree, including dirty/untracked files but excluding all `.git`
+   entries, into a root-owned `0700` snapshot under `/run`, rescans it, and
+   rebuilds it with forced `path:` semantics. The daemon performs an equivalent
+   sanitized-path build before approval, so Git config/includeIf, fsmonitor or
+   other helpers, core.worktree, and object alternates are never consumed by
+   either local build. Local absolute, `path:`, `file:`, and `git+file:` refs with
+   query parameters are rejected rather than partially validated. Remote refs
+   retain native Nix resolution semantics. Any non-service actor allowed to
+   write the source is explicitly trusted like root for approved switches; the
+   scanner blocks daemon/service/group/world/ACL writes, not concurrent edits by
+   root or another authorized administrator. `nix
+   flake update ...` stays in a host-side
+   timer and is not granted to the daemon. If the daemon is exploited, blast
+   radius = activation only when root's own rebuild matches the approved
+   toplevel, not arbitrary store-path root execution. The daemon must invoke it
+   as an argv vector (`exec`), never through a shell string.
 4. **Request↔approval binding via nonce.** Each request gets an unguessable id;
    the inline-keyboard callback carries it. An old Approve button must not trigger
    a new/different switch (no replay). One-shot: a nonce is consumed on
@@ -82,6 +112,11 @@ The daemon can cause a root `nixos-rebuild switch`. Containment:
    Socket perms restrict who can submit.
 7. **Informed approval.** The approval message shows WHAT would change (see
    Approval UX) so the operator does not rubber-stamp a planted change.
+8. **Activation sandbox compatibility.** The daemon service keeps compatible
+   hardening (`PrivateTmp`, `UMask=0077`, locked personality, native syscalls,
+   no realtime, protected control groups) but must not enable private devices,
+   kernel tunable/module protections, or `NoNewPrivileges`; activation inherits
+   the service sandbox and needs sudo plus NixOS kernel/device activation writes.
 
 ## Approval UX (default — confirm/adjust)
 
@@ -163,7 +198,7 @@ counterpart. Suggested names (finalize + document in README):
 | `SWITCHD_FLAKE_REF` / `SWITCHD_FLAKE_REF_FILE` | ref to switch; `_FILE` supported for path privacy | no (default `<SWITCHD_REPO_DIR>#homeserver`) |
 | `SWITCHD_SYNC_TIMEOUT` / `SWITCHD_ASYNC_TIMEOUT` | build + approval windows; not reused for activation | no |
 | `SWITCHD_ACTIVATE_TIMEOUT` | activation timeout that starts only after approval (default `30m`; `0` = no artificial activation deadline) | no |
-| `SWITCHD_ACTIVATE_CMD` | activation argv prefix (default `sudo`); daemon appends `<built-toplevel>/bin/switch-to-configuration switch` | no |
+| `SWITCHD_ACTIVATE_CMD` | activation argv prefix; NixOS module fixes it internally to `/run/wrappers/bin/sudo <switchd-activate-store-path>` with no override option; daemon appends `<pre-approved-toplevel>/bin/switch-to-configuration switch` | no |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Alloy OTLP | no |
 
 ## Host integration contract (separate homelab task — do NOT build here)
@@ -172,8 +207,12 @@ For reference so the interfaces stay stable. In the `homelab` repo:
 
 - Add this repo as a flake input; new `services/switch-daemon.nix`:
   - user `switchd` (non-login), group for socket access.
-  - `security.sudo` (or polkit) rule: `switchd` may run ONLY the already-built
-    toplevel activation (`/nix/store/.../bin/switch-to-configuration switch`) and `nix flake update ...` NOPASSWD.
+  - `security.sudo` (or polkit) rule: `switchd` may run ONLY the fixed
+    module-generated activation helper path NOPASSWD; the helper rebuilds the
+    configured flake as root with a private out-link, compares that rebuilt
+    toplevel to the pre-approved toplevel, and activates only the rebuilt
+    toplevel. Do not grant wildcard store activation or root flake-update
+    permissions to the daemon.
   - `systemd.tmpfiles` for the socket dir (`/run/switchd`, `switchd`-owned).
   - sops `secrets/switch-portal.yaml` (bot_token, allowed_user_ids, chat_id),
     owner `switchd`, exposed via the `*_FILE` env vars.

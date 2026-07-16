@@ -156,6 +156,61 @@ func TestEscapedTrimStaysBounded(t *testing.T) {
 	}
 }
 
+func TestSanitizedBuildRefExcludesGitMetadataAndKeepsDirtyContent(t *testing.T) {
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "flake.nix"), []byte("dirty untracked"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitDir := filepath.Join(source, ".git")
+	if err := os.MkdirAll(filepath.Join(gitDir, "objects", "info"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	metadata := map[string]string{
+		"config":                  "[include]\npath=/tmp/evil\n[core]\nworktree=/tmp/worktree\nfsmonitor=/tmp/helper\n",
+		"objects/info/alternates": "/tmp/objects\n",
+	}
+	for name, content := range metadata {
+		if err := os.WriteFile(filepath.Join(gitDir, name), []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ref, cleanup, err := sanitizedBuildRef("git+file://" + source + "#homeserver")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	if !strings.HasPrefix(ref, "path:") || !strings.HasSuffix(ref, "#homeserver") {
+		t.Fatalf("local ref was not rewritten to path semantics: %q", ref)
+	}
+	snapshot := strings.TrimSuffix(strings.TrimPrefix(ref, "path:"), "#homeserver")
+	if _, err := os.Lstat(filepath.Join(snapshot, ".git")); !os.IsNotExist(err) {
+		t.Fatalf("Git metadata copied into snapshot: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(snapshot, "flake.nix"))
+	if err != nil || string(got) != "dirty untracked" {
+		t.Fatalf("dirty content missing: %q, %v", got, err)
+	}
+}
+
+func TestSanitizedBuildRefLeavesRemoteRefNative(t *testing.T) {
+	const remote = "github:example/flake?rev=abc#host"
+	got, cleanup, err := sanitizedBuildRef(remote)
+	defer cleanup()
+	if err != nil || got != remote {
+		t.Fatalf("remote ref = %q, %v", got, err)
+	}
+}
+
+func TestCopySanitizedTreeRejectsSpecialFile(t *testing.T) {
+	source := t.TempDir()
+	if err := os.Symlink("/dev/null", filepath.Join(source, "escape")); err != nil {
+		t.Fatal(err)
+	}
+	if err := copySanitizedTree(source, filepath.Join(t.TempDir(), "snapshot")); err == nil || !strings.Contains(err.Error(), "escapes source tree") {
+		t.Fatalf("expected escaping symlink rejection, got %v", err)
+	}
+}
+
 func TestResolveBuiltToplevelRejectsNonStoreResult(t *testing.T) {
 	dir := t.TempDir()
 	built := filepath.Join(dir, "built")
