@@ -156,6 +156,54 @@ func TestEscapedTrimStaysBounded(t *testing.T) {
 	}
 }
 
+func TestToplevelInstallablePreservesRefAndQuotesFragment(t *testing.T) {
+	for _, tc := range []struct {
+		ref  string
+		want string
+	}{
+		{"github:example/flake?rev=abc#host", `github:example/flake?rev=abc#nixosConfigurations."host".config.system.build.toplevel`},
+		{"path:/etc/nixos#host.example-1", `path:/etc/nixos#nixosConfigurations."host.example-1".config.system.build.toplevel`},
+		{"github:example/flake#café", `github:example/flake#nixosConfigurations."café".config.system.build.toplevel`},
+		{"github:example/flake#host\\name", `github:example/flake#nixosConfigurations."host\\name".config.system.build.toplevel`},
+		{"github:example/flake#host\"name", `github:example/flake#nixosConfigurations."host\"name".config.system.build.toplevel`},
+	} {
+		got, err := toplevelInstallable(tc.ref)
+		if err != nil {
+			t.Fatalf("toplevelInstallable(%q): %v", tc.ref, err)
+		}
+		if got != tc.want {
+			t.Fatalf("toplevelInstallable(%q) = %q, want %q", tc.ref, got, tc.want)
+		}
+	}
+}
+
+func TestToplevelInstallableRejectsMalformedOrAmbiguousRef(t *testing.T) {
+	for _, ref := range []string{"github:example/flake", "#host", "github:example/flake#", "github:example/flake#host#extra", "--offline#host", "github:example/flake#bad\nname", "github:example/flake#bad\x7fname"} {
+		if got, err := toplevelInstallable(ref); err == nil {
+			t.Fatalf("toplevelInstallable(%q) = %q, want error", ref, got)
+		}
+	}
+}
+
+func TestToplevelBuildArgvUsesFixedNixBuildOutLink(t *testing.T) {
+	got, err := toplevelBuildArgv("github:example/flake#host name", "/run/switchd/result")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"nix", "build", "--out-link", "/run/switchd/result", `github:example/flake#nixosConfigurations."host name".config.system.build.toplevel`}
+	if len(got) != len(want) {
+		t.Fatalf("argv = %#v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("argv[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+	if _, err := toplevelBuildArgv("github:example/flake#host", "relative/result"); err == nil {
+		t.Fatal("expected relative out-link rejection")
+	}
+}
+
 func TestSanitizedBuildRefExcludesGitMetadataAndKeepsDirtyContent(t *testing.T) {
 	source := t.TempDir()
 	if err := os.WriteFile(filepath.Join(source, "flake.nix"), []byte("dirty untracked"), 0644); err != nil {
@@ -271,6 +319,28 @@ func assertPermissionError(t *testing.T, err error, path string, operation permi
 	}
 }
 
+func TestResolveBuiltToplevelAcceptsCurrentNixOutLink(t *testing.T) {
+	const currentSystem = "/run/current-system"
+	if _, err := os.Stat(filepath.Join(currentSystem, "bin/switch-to-configuration")); err != nil {
+		t.Skipf("current host has no NixOS toplevel: %v", err)
+	}
+	outLink := filepath.Join(t.TempDir(), "result")
+	if err := os.Symlink(currentSystem, outLink); err != nil {
+		t.Fatal(err)
+	}
+	got, err := resolveBuiltToplevel(outLink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := filepath.EvalSymlinks(currentSystem)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("resolved toplevel = %q, want %q", got, want)
+	}
+}
+
 func TestResolveBuiltToplevelRejectsNonStoreResult(t *testing.T) {
 	dir := t.TempDir()
 	built := filepath.Join(dir, "built")
@@ -283,14 +353,21 @@ func TestResolveBuiltToplevelRejectsNonStoreResult(t *testing.T) {
 	if err := os.Symlink(built, filepath.Join(dir, "result")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := resolveBuiltToplevel(dir); err == nil || !strings.Contains(err.Error(), "not under /nix/store/") {
+	if _, err := resolveBuiltToplevel(filepath.Join(dir, "result")); err == nil || !strings.Contains(err.Error(), "not under /nix/store/") {
 		t.Fatalf("expected non-store error, got %v", err)
 	}
 }
 
-func TestResolveBuiltToplevelRejectsMissingResult(t *testing.T) {
-	if _, err := resolveBuiltToplevel(t.TempDir()); err == nil || !strings.Contains(err.Error(), "resolve result symlink") {
-		t.Fatalf("expected resolve error, got %v", err)
+func TestResolveBuiltToplevelRejectsMissingOrNonSymlinkResult(t *testing.T) {
+	outLink := filepath.Join(t.TempDir(), "result")
+	if _, err := resolveBuiltToplevel(outLink); err == nil || !strings.Contains(err.Error(), "inspect result out-link") {
+		t.Fatalf("expected missing out-link error, got %v", err)
+	}
+	if err := os.WriteFile(outLink, []byte("not a symlink"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveBuiltToplevel(outLink); err == nil || !strings.Contains(err.Error(), "is not a symlink") {
+		t.Fatalf("expected non-symlink error, got %v", err)
 	}
 }
 

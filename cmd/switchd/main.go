@@ -1,6 +1,6 @@
 // Command switchd is the switch-approval daemon. It accepts fixed-shape switch
 // requests over a Unix socket, asks an allow-listed Telegram user to approve a
-// nonce-bound request, then runs fixed argv-vector nixos-rebuild commands.
+// nonce-bound request, then runs fixed argv-vector Nix build and activation commands.
 package main
 
 import (
@@ -28,6 +28,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -339,12 +340,24 @@ func (d *daemon) runRequest(st *requestState) {
 		return
 	}
 	defer cleanupSnapshot()
-	if err := d.runCmd(preApprovalCtx, st, logFile, []string{"nixos-rebuild", "build", "--flake", buildRef, "--out-link", filepath.Join(d.cfg.RepoDir, "result")}); err != nil {
+	buildDir, err := os.MkdirTemp("", "switchd-build-")
+	if err != nil {
+		d.emit(st, frame{Type: "error", Message: "prepare build output: " + err.Error()})
+		return
+	}
+	defer os.RemoveAll(buildDir)
+	outLink := filepath.Join(buildDir, "result")
+	buildArgv, err := toplevelBuildArgv(buildRef, outLink)
+	if err != nil {
+		d.emit(st, frame{Type: "error", Message: "prepare build installable: " + err.Error()})
+		return
+	}
+	if err := d.runCmd(preApprovalCtx, st, logFile, buildArgv); err != nil {
 		d.emit(st, frame{Type: "error", Message: "build failed: " + err.Error()})
 		d.notify(st, "Build failed", tail(st.logTail, 25))
 		return
 	}
-	st.toplevelPath, err = resolveBuiltToplevel(d.cfg.RepoDir)
+	st.toplevelPath, err = resolveBuiltToplevel(outLink)
 	if err != nil {
 		d.emit(st, frame{Type: "error", Message: "built toplevel invalid: " + err.Error()})
 		d.notify(st, "Build produced invalid toplevel", []string{err.Error()})
@@ -405,7 +418,6 @@ func (d *daemon) runCmd(ctx context.Context, st *requestState, logFile io.Writer
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = d.cfg.RepoDir
 	cmd.Env = os.Environ()
-	cmd.Env = append(cmd.Env, "NIXOS_SWITCH_APPROVAL_TOPLEVEL="+filepath.Join(d.cfg.RepoDir, "result"))
 	out, err := cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("stdout pipe: %w", err)
@@ -431,7 +443,49 @@ func (d *daemon) runCmd(ctx context.Context, st *requestState, logFile io.Writer
 	return nil
 }
 
+func toplevelBuildArgv(flakeRef, outLink string) ([]string, error) {
+	installable, err := toplevelInstallable(flakeRef)
+	if err != nil {
+		return nil, err
+	}
+	if !filepath.IsAbs(outLink) || filepath.Clean(outLink) != outLink {
+		return nil, fmt.Errorf("out-link must be a canonical absolute path")
+	}
+	return []string{"nix", "build", "--out-link", outLink, installable}, nil
+}
+
+func toplevelInstallable(flakeRef string) (string, error) {
+	if !utf8.ValidString(flakeRef) {
+		return "", fmt.Errorf("flake ref must be valid UTF-8")
+	}
+	if strings.Count(flakeRef, "#") != 1 {
+		return "", fmt.Errorf("flake ref must contain exactly one fragment separator")
+	}
+	base, fragment, _ := strings.Cut(flakeRef, "#")
+	if base == "" || fragment == "" {
+		return "", fmt.Errorf("flake ref and fragment must both be non-empty")
+	}
+	if strings.HasPrefix(base, "-") {
+		return "", fmt.Errorf("flake ref must not begin with an option prefix")
+	}
+	var quoted strings.Builder
+	for _, r := range fragment {
+		if r < ' ' || r == '\u007f' {
+			return "", fmt.Errorf("flake fragment %q contains unsupported characters", fragment)
+		}
+		switch r {
+		case '"', '\\':
+			quoted.WriteByte('\\')
+		}
+		quoted.WriteRune(r)
+	}
+	return base + `#nixosConfigurations."` + quoted.String() + `".config.system.build.toplevel`, nil
+}
+
 func sanitizedBuildRef(ref string) (string, func(), error) {
+	if _, err := toplevelInstallable(ref); err != nil {
+		return "", func() {}, err
+	}
 	path, fragment, local, err := localFlakeRef(ref)
 	if err != nil || !local {
 		return ref, func() {}, err
@@ -601,10 +655,17 @@ func copyRegularFile(source, destination string, mode os.FileMode) error {
 	return closeErr
 }
 
-func resolveBuiltToplevel(repoDir string) (string, error) {
-	path, err := filepath.EvalSymlinks(filepath.Join(repoDir, "result"))
+func resolveBuiltToplevel(outLink string) (string, error) {
+	info, err := os.Lstat(outLink)
 	if err != nil {
-		return "", fmt.Errorf("resolve result symlink: %w", err)
+		return "", fmt.Errorf("inspect result out-link: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return "", fmt.Errorf("result out-link %q is not a symlink", outLink)
+	}
+	path, err := filepath.EvalSymlinks(outLink)
+	if err != nil {
+		return "", fmt.Errorf("resolve result out-link: %w", err)
 	}
 	path, err = filepath.Abs(path)
 	if err != nil {
@@ -614,7 +675,7 @@ func resolveBuiltToplevel(repoDir string) (string, error) {
 		return "", fmt.Errorf("resolved result %q is not under /nix/store/", path)
 	}
 	switchToConfiguration := filepath.Join(path, "bin/switch-to-configuration")
-	info, err := os.Stat(switchToConfiguration)
+	info, err = os.Stat(switchToConfiguration)
 	if err != nil {
 		return "", fmt.Errorf("missing switch-to-configuration at %q: %w", switchToConfiguration, err)
 	}

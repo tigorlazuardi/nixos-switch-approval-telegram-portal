@@ -370,11 +370,24 @@ default:mask::rw-'
                   echo "activation helper does not exclude Git metadata" >&2
                   exit 1
                 }
-                rebuild_line=$(grep -n -F 'nixos-rebuild build --flake "$trusted_flake_ref"' "$helper_script" | cut -d: -f1)
+                grep -F 'escaped_flake_fragment=$(printf' "$helper_script" >/dev/null || {
+                  echo "activation helper does not escape generic flake fragments" >&2
+                  exit 1
+                }
+                grep -F 'trusted_installable="$trusted_flake_path#nixosConfigurations.\"$escaped_flake_fragment\".config.system.build.toplevel"' "$helper_script" >/dev/null || {
+                  echo "activation helper does not construct exact toplevel installable" >&2
+                  exit 1
+                }
+                rebuild_line=$(grep -n -F 'nix build --out-link "$tmp/result" "$trusted_installable"' "$helper_script" | cut -d: -f1)
+                [ -n "$rebuild_line" ] || { echo "activation helper does not use Nix out-link build" >&2; exit 1; }
                 [ "$snapshot_line" -lt "$rebuild_line" ] || {
                   echo "activation helper rebuilds before snapshot binding" >&2
                   exit 1
                 }
+                if grep -F -- '--out-link' "$helper_script" | grep -Fv 'nix build --out-link "$tmp/result" "$trusted_installable"' >/dev/null; then
+                  echo "activation helper contains an unexpected out-link command" >&2
+                  exit 1
+                fi
 
                 ${pkgs.lib.concatMapStringsSep "\n"
                   (name: ''

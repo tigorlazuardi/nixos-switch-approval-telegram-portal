@@ -55,6 +55,7 @@ let
             pkgs.findutils
             pkgs.gawk
             pkgs.glibc
+            pkgs.gnused
             pkgs.gnutar
             config.nix.package
             pkgs.git
@@ -109,8 +110,20 @@ let
 
         # ponytail: local refs use a root-owned exact snapshot; remote refs retain native Nix pinning semantics.
         snapshot_trusted_flake_ref "$tmp"
-        ${pkgs.nixos-rebuild}/bin/nixos-rebuild build --flake "$trusted_flake_ref" --out-link "$tmp/result"
+        trusted_flake_path=''${trusted_flake_ref%%#*}
+        trusted_flake_fragment=''${trusted_flake_ref#*#}
+        [ "$trusted_flake_path" != "$trusted_flake_ref" ] || fail "trusted flake ref must contain a fragment"
+        [ -n "$trusted_flake_path" ] || fail "trusted flake ref path is empty"
+        case "$trusted_flake_path" in -*) fail "trusted flake ref must not begin with an option prefix" ;; esac
+        [ -n "$trusted_flake_fragment" ] || fail "trusted flake ref fragment is empty"
+        case "$trusted_flake_fragment" in *'#'*) fail "trusted flake ref must contain exactly one fragment separator" ;; esac
+        case "$trusted_flake_fragment" in *[![:print:]]*) fail "trusted flake fragment contains unsupported characters" ;; esac
+        escaped_flake_fragment=$(printf '%s' "$trusted_flake_fragment" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        trusted_installable="$trusted_flake_path#nixosConfigurations.\"$escaped_flake_fragment\".config.system.build.toplevel"
+        ${config.nix.package}/bin/nix build --out-link "$tmp/result" "$trusted_installable"
+        [ -L "$tmp/result" ] || fail "Nix did not create the toplevel out-link"
         trusted_toplevel=$(readlink -f -- "$tmp/result")
+        case "$trusted_toplevel" in /nix/store/*) ;; *) fail "rebuilt toplevel is not in the Nix store" ;; esac
 
         if [ "$trusted_toplevel" != "$expected_toplevel" ]; then
           printf 'switchd-activate: rebuilt toplevel mismatch\n' >&2
