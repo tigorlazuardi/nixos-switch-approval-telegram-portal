@@ -2,7 +2,7 @@
 
 buildGoModule {
   pname = "nixos-switch-approval-telegram-portal";
-  version = "0.2.2";
+  version = "0.2.3";
   src = ../.;
   vendorHash = null;
 
