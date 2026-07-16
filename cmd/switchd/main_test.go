@@ -166,6 +166,8 @@ func TestToplevelInstallablePreservesRefAndQuotesFragment(t *testing.T) {
 		{"github:example/flake#café", `github:example/flake#nixosConfigurations."café".config.system.build.toplevel`},
 		{"github:example/flake#host\\name", `github:example/flake#nixosConfigurations."host\\name".config.system.build.toplevel`},
 		{"github:example/flake#host\"name", `github:example/flake#nixosConfigurations."host\"name".config.system.build.toplevel`},
+		{"github:example/flake#host${name}", `github:example/flake#nixosConfigurations."host\${name}".config.system.build.toplevel`},
+		{"github:example/flake#host\\${name}", `github:example/flake#nixosConfigurations."host\\\${name}".config.system.build.toplevel`},
 	} {
 		got, err := toplevelInstallable(tc.ref)
 		if err != nil {

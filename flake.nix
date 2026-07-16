@@ -374,6 +374,11 @@ default:mask::rw-'
                   echo "activation helper does not escape generic flake fragments" >&2
                   exit 1
                 }
+                escaped_fragment_test=$(printf 'host\x5c\x24{name}' | sed 's/\\/\\\\/g; s/"/\\"/g; s/[$][{]/\\&/g')
+                [ "$escaped_fragment_test" = "$(printf 'host\x5c\x5c\x5c\x24{name}')" ] || {
+                  echo "activation helper fragment encoding does not preserve interpolation openers literally" >&2
+                  exit 1
+                }
                 grep -F 'trusted_installable="$trusted_flake_path#nixosConfigurations.\"$escaped_flake_fragment\".config.system.build.toplevel"' "$helper_script" >/dev/null || {
                   echo "activation helper does not construct exact toplevel installable" >&2
                   exit 1

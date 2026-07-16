@@ -469,12 +469,11 @@ func toplevelInstallable(flakeRef string) (string, error) {
 		return "", fmt.Errorf("flake ref must not begin with an option prefix")
 	}
 	var quoted strings.Builder
-	for _, r := range fragment {
+	for i, r := range fragment {
 		if r < ' ' || r == '\u007f' {
 			return "", fmt.Errorf("flake fragment %q contains unsupported characters", fragment)
 		}
-		switch r {
-		case '"', '\\':
+		if r == '"' || r == '\\' || r == '$' && i+1 < len(fragment) && fragment[i+1] == '{' {
 			quoted.WriteByte('\\')
 		}
 		quoted.WriteRune(r)

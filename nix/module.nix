@@ -118,7 +118,7 @@ let
         [ -n "$trusted_flake_fragment" ] || fail "trusted flake ref fragment is empty"
         case "$trusted_flake_fragment" in *'#'*) fail "trusted flake ref must contain exactly one fragment separator" ;; esac
         case "$trusted_flake_fragment" in *[![:print:]]*) fail "trusted flake fragment contains unsupported characters" ;; esac
-        escaped_flake_fragment=$(printf '%s' "$trusted_flake_fragment" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        escaped_flake_fragment=$(printf '%s' "$trusted_flake_fragment" | sed 's/\\/\\\\/g; s/"/\\"/g; s/[$][{]/\\&/g')
         trusted_installable="$trusted_flake_path#nixosConfigurations.\"$escaped_flake_fragment\".config.system.build.toplevel"
         ${config.nix.package}/bin/nix build --out-link "$tmp/result" "$trusted_installable"
         [ -L "$tmp/result" ] || fail "Nix did not create the toplevel out-link"
