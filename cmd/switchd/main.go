@@ -473,7 +473,13 @@ func localFlakeRef(ref string) (path, fragment string, local bool, err error) {
 		return "", "", false, fmt.Errorf("local flake path must be canonical and absolute")
 	}
 	resolved, resolveErr := filepath.EvalSymlinks(path)
-	if resolveErr != nil || resolved != path {
+	if resolveErr != nil {
+		if errors.Is(resolveErr, os.ErrPermission) {
+			return "", "", false, sourcePermissionError(path, permissionResolve, resolveErr)
+		}
+		return "", "", false, fmt.Errorf("local flake path must exist and contain no symlinks: %w", resolveErr)
+	}
+	if resolved != path {
 		return "", "", false, fmt.Errorf("local flake path must exist and contain no symlinks")
 	}
 	if fragment != "" {
@@ -485,6 +491,9 @@ func localFlakeRef(ref string) (path, fragment string, local bool, err error) {
 func copySanitizedTree(source, destination string) error {
 	info, err := os.Lstat(source)
 	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			return sourcePermissionError(source, permissionResolve, err)
+		}
 		return fmt.Errorf("inspect local flake: %w", err)
 	}
 	if !info.IsDir() {
@@ -495,6 +504,9 @@ func copySanitizedTree(source, destination string) error {
 	}
 	return filepath.WalkDir(source, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
+			if errors.Is(walkErr, os.ErrPermission) {
+				return sourcePermissionError(path, permissionEnumerate, walkErr)
+			}
 			return walkErr
 		}
 		if path == source {
@@ -513,6 +525,9 @@ func copySanitizedTree(source, destination string) error {
 		dst := filepath.Join(destination, rel)
 		info, err := entry.Info()
 		if err != nil {
+			if errors.Is(err, os.ErrPermission) {
+				return sourcePermissionError(path, permissionResolve, err)
+			}
 			return err
 		}
 		switch {
@@ -530,6 +545,9 @@ func copySanitizedTree(source, destination string) error {
 			}
 			resolved, err := filepath.EvalSymlinks(path)
 			if err != nil {
+				if errors.Is(err, os.ErrPermission) {
+					return sourcePermissionError(path, permissionResolve, err)
+				}
 				return fmt.Errorf("local flake contains dangling symlink %q: %w", path, err)
 			}
 			resolved, err = filepath.Abs(resolved)
@@ -546,9 +564,28 @@ func copySanitizedTree(source, destination string) error {
 	})
 }
 
+type permissionOperation string
+
+const (
+	permissionResolve   permissionOperation = "source and ancestor directories need execute/traverse permission"
+	permissionEnumerate permissionOperation = "directory needs read and execute/traverse permission"
+	permissionRead      permissionOperation = "regular file needs read permission"
+)
+
+func sourcePermissionError(path string, operation permissionOperation, err error) error {
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) && pathErr.Path != "" {
+		path = pathErr.Path
+	}
+	return fmt.Errorf("cannot access local flake path %q: %s: %w", path, operation, err)
+}
+
 func copyRegularFile(source, destination string, mode os.FileMode) error {
 	in, err := os.Open(source)
 	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			return sourcePermissionError(source, permissionRead, err)
+		}
 		return err
 	}
 	defer in.Close()

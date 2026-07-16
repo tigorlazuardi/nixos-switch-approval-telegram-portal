@@ -74,6 +74,54 @@
           ) flakeOnlyEval.config.assertions;
         in
         {
+          unix-group-access = pkgs.testers.runNixOSTest {
+            name = "switchd-unix-group-access";
+            nodes.machine = { pkgs, ... }: {
+              users.groups.switchd = { };
+              users.users = {
+                operator = {
+                  isNormalUser = true;
+                  group = "users";
+                  extraGroups = [ "switchd" ];
+                };
+                switchd = {
+                  isSystemUser = true;
+                  group = "switchd";
+                };
+              };
+              environment.systemPackages = [ pkgs.python3 ];
+              systemd.services.switchd-socket-test = {
+                wantedBy = [ "multi-user.target" ];
+                serviceConfig = {
+                  User = "switchd";
+                  Group = "switchd";
+                  RuntimeDirectory = "switchd-test";
+                  ExecStart = "${pkgs.python3}/bin/python ${pkgs.writeText "switchd-socket-test.py" ''
+                    import os, socket
+                    path = "/run/switchd-test/sock"
+                    server = socket.socket(socket.AF_UNIX)
+                    server.bind(path)
+                    os.chmod(path, 0o660)
+                    server.listen(1)
+                    connection, _ = server.accept()
+                    connection.close()
+                  ''}";
+                };
+              };
+            };
+            testScript = ''
+              start_all()
+              machine.succeed("install -d -o operator -g switchd -m 0710 /home/operator")
+              machine.succeed("install -d -o operator -g switchd -m 0750 /home/operator/repo")
+              machine.succeed("printf readable > /home/operator/repo/flake.nix")
+              machine.succeed("chown operator:switchd /home/operator/repo/flake.nix && chmod 0640 /home/operator/repo/flake.nix")
+              machine.succeed("runuser -u switchd -- cat /home/operator/repo/flake.nix | grep -Fx readable")
+              machine.fail("runuser -u switchd -- sh -c 'printf x >> /home/operator/repo/flake.nix'")
+              machine.wait_for_unit("switchd-socket-test.service")
+              machine.succeed("runuser -u operator -- python -c 'import socket; s=socket.socket(socket.AF_UNIX); s.connect(\"/run/switchd-test/sock\")'")
+            '';
+          };
+
           trusted-path = pkgs.runCommand "switchd-trusted-path" { nativeBuildInputs = [ pkgs.acl ]; } ''
             set -eu
 
@@ -92,6 +140,18 @@
             ln -s target trusted/result
             ln -s ${pkgs.hello}/bin/hello trusted/store-result
             require_trusted_path "$PWD/trusted"
+
+            mkdir -m 0750 group-readable
+            chgrp "$supplementary_gid" group-readable
+            printf safe > group-readable/flake.nix
+            chgrp "$supplementary_gid" group-readable/flake.nix
+            chmod 0640 group-readable/flake.nix
+            require_trusted_path "$PWD/group-readable"
+            chmod 0660 group-readable/flake.nix
+            if (require_trusted_path "$PWD/group-readable"); then
+              echo "service-group-writable source passed trust scan" >&2
+              exit 1
+            fi
 
             ln -s /etc/passwd trusted/escape
             if (require_trusted_path "$PWD/trusted"); then

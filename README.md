@@ -116,19 +116,66 @@ realtime scheduling, and protected control-group settings. It intentionally does
 protection because activation inherits the service sandbox and must call sudo
 and write NixOS activation kernel/device state.
 
+### Local flake access with a shared Unix group
+
+No ACL is needed. Use `services.switchd.group` as a native Unix sharing group:
+
+```nix
+{ config, ... }:
+{
+  services.switchd = {
+    enable = true;
+    user = "switchd";
+    group = "switchd";
+    repoDir = "/home/operator/nixos";
+    flakeRef = "/home/operator/nixos#host";
+    # secret file options omitted here
+  };
+
+  users.users.operator.extraGroups = [ config.services.switchd.group ];
+
+  # Only these named directories are managed. This does not recursively change
+  # ownership or modes inside an arbitrary existing repository.
+  systemd.tmpfiles.rules = [
+    "d /home/operator 0710 operator switchd -"
+    "d /home/operator/nixos 2750 operator switchd -"
+  ];
+}
+```
+
+Exact contract: `/home/operator` is owned by `operator:switchd` with mode `0710`.
+The configured repo/source and its entries remain owned by the trusted operator,
+not the daemon, with group `switchd`; directories grant group read/traverse but
+not write (normally `2750` or `0750`), and regular files grant group read but not
+write (normally `0640`). Setgid on the repo directory only preserves group
+inheritance. Create/update files with a non-group-writable umask such as `0027`.
+Use stricter modes where an entry does not need daemon access. For example, the
+same contract applies to `/home/homeserver/homelab` by substituting operator and
+path names. Do not recursively `chown` or `chmod` a user repository from this
+module; establish intended ownership when creating or deliberately maintaining
+that repo.
+
+The operator owner remains writable and is therefore the trusted source writer.
+The `switchd` service identity receives only directory traversal and file read;
+it cannot mutate the source. The daemon socket is `0660`, owned through the
+service's runtime group, so membership in `config.services.switchd.group` also
+authorizes an operator to connect with `request-switch`. Telegram approval and
+all trusted-path checks still apply after a request is accepted.
+
 The trusted flake source is part of the root boundary. `repoDir`, `repoDirFile`,
 `flakeRefFile`, and any local path in `flakeRef` must resolve to canonical absolute
 paths with no symlinks and must not be owned by the service user or writable by
-that user, any of its primary/supplementary groups, ACL grants, or world. ACL
-inspection fails closed. The helper checks every ancestor and local source-tree
-entry, then copies a local flake into a root-owned `0700` snapshot under `/run`,
-excluding every `.git` entry and forcing `path:` flake semantics so Git config,
-includes, hooks/helpers, worktrees, and object alternates are never consumed by
-the root build. The daemon uses the same sanitized-path policy before approval;
-dirty and untracked filesystem content is preserved. Local absolute, `path:`,
-`file:`, and `git+file:` refs containing `?` are rejected because query parameters
-can change flake semantics beyond the validated path. Remote flake refs retain
-Nix's native resolution semantics.
+that user, any of its primary/supplementary groups, ACL grants, or world. Group
+read/traverse is allowed; group write is not. ACL inspection fails closed and is
+only validation, not an access-grant mechanism. The helper checks every ancestor
+and local source-tree entry, then copies a local flake into a root-owned `0700`
+snapshot under `/run`, excluding every `.git` entry and forcing `path:` flake
+semantics so Git config, includes, hooks/helpers, worktrees, and object alternates
+are never consumed by the root build. The daemon uses the same sanitized-path
+policy before approval; dirty and untracked filesystem content is preserved.
+Local absolute, `path:`, `file:`, and `git+file:` refs containing `?` are rejected
+because query parameters can change flake semantics beyond the validated path.
+Remote flake refs retain Nix's native resolution semantics.
 
 Trust assumption: any non-service actor permitted to write the configured source
 is an authorized trusted source writer, equivalent to root for approved switches.

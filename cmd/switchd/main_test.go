@@ -211,6 +211,66 @@ func TestCopySanitizedTreeRejectsSpecialFile(t *testing.T) {
 	}
 }
 
+func TestCopySanitizedTreeReportsDirectoryEnumerationPermission(t *testing.T) {
+	requirePermissionEnforcement(t)
+	source := t.TempDir()
+	locked := filepath.Join(source, "locked")
+	if err := os.Mkdir(locked, 0111); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(locked, 0700)
+
+	err := copySanitizedTree(source, filepath.Join(t.TempDir(), "snapshot"))
+	assertPermissionError(t, err, locked, permissionEnumerate)
+}
+
+func TestCopySanitizedTreeReportsRegularFileReadPermission(t *testing.T) {
+	requirePermissionEnforcement(t)
+	source := t.TempDir()
+	locked := filepath.Join(source, "locked")
+	if err := os.WriteFile(locked, []byte("secret"), 0000); err != nil {
+		t.Fatal(err)
+	}
+
+	err := copySanitizedTree(source, filepath.Join(t.TempDir(), "snapshot"))
+	assertPermissionError(t, err, locked, permissionRead)
+}
+
+func TestCopySanitizedTreeReportsSymlinkResolutionPermission(t *testing.T) {
+	requirePermissionEnforcement(t)
+	outside := t.TempDir()
+	locked := filepath.Join(outside, "locked")
+	if err := os.Mkdir(locked, 0000); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(locked, 0700)
+	source := t.TempDir()
+	link := filepath.Join(source, "link")
+	if err := os.Symlink(filepath.Join(locked, "target"), link); err != nil {
+		t.Fatal(err)
+	}
+
+	err := copySanitizedTree(source, filepath.Join(t.TempDir(), "snapshot"))
+	assertPermissionError(t, err, filepath.Join(locked, "target"), permissionResolve)
+	if strings.Contains(err.Error(), "dangling symlink") {
+		t.Fatalf("permission failure mislabeled as dangling symlink: %v", err)
+	}
+}
+
+func requirePermissionEnforcement(t *testing.T) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses mode-bit permission boundaries")
+	}
+}
+
+func assertPermissionError(t *testing.T, err error, path string, operation permissionOperation) {
+	t.Helper()
+	if err == nil || !errors.Is(err, os.ErrPermission) || !strings.Contains(err.Error(), path) || !strings.Contains(err.Error(), string(operation)) {
+		t.Fatalf("permission error = %v; want path %q and operation %q", err, path, operation)
+	}
+}
+
 func TestResolveBuiltToplevelRejectsNonStoreResult(t *testing.T) {
 	dir := t.TempDir()
 	built := filepath.Join(dir, "built")
